@@ -120,7 +120,8 @@ def get_status():
 # --- LOOKUP ---
 
 def classify(raw):
-    """Same rules as sgb_sync.classify: ('domain'|'ip'|'ipv6'|'url', value) or None."""
+    """Normalizes a query like sgb_sync.classify: ('domain'|'ip'|'ipv6'|'url', value) or None.
+    Unlike sgb_sync.classify it does not drop non-public IPs or malformed names, so any input can be looked up."""
     s = (raw or "").strip()
     if not s:
         return None
