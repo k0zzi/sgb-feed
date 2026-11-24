@@ -16,7 +16,7 @@ The full history is kept in a SQLite database (/data/sgb.db). On every run:
 
 If a scan does not complete (error, page limit, stop signal) the database and feeds are left untouched;
 the next scheduled run starts over.
-Assumption: the API returns records newest to oldest (descending ID).
+Assumption: the API returns records newest to oldest by date. IDs do not follow that order strictly (see scan_into).
 """
 import datetime as dt
 import html
