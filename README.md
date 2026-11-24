@@ -38,13 +38,15 @@ A Docker-based tool that keeps the **entire** malicious-address list published b
 
 ## Installation
 
-Requirements: Docker and Docker Compose (a Linux server or VM is recommended).
+Requirements: `git`, and Docker Engine with the Compose plugin (see Docker's [installation guide for Ubuntu](https://docs.docker.com/engine/install/ubuntu/)). A Linux server or VM is recommended. Tested on a clean Ubuntu Server 24.04 install with Docker Engine 29.10.0 and Compose 5.8.0.
+
+Docker commands need `sudo` unless your user is in the `docker` group (see the post-installation notes in the Docker documentation). The commands below are written without `sudo`.
 
 ```bash
 git clone https://github.com/k0zzi/sgb-feed.git
 cd sgb-feed
 cp .env.example .env
-nano .env            # set UI_PASS, UI_ALLOWED, FEED_ALLOWED and CERT_IP (see below)
+nano .env            # or any editor: set UI_PASS, UI_ALLOWED, FEED_ALLOWED and CERT_IP (see below)
 docker compose up -d --build
 ```
 
@@ -81,6 +83,8 @@ You can check the certificate from any machine that has `ca.crt`:
 ```bash
 curl --cacert ca.crt https://SERVER_IP:1818/feed/index.json
 ```
+
+With the Windows `curl.exe` this can fail with `schannel: the revocation status is unknown`, because the certificate carries no revocation (CRL/OCSP) address. For the test, add `--ssl-no-revoke`. Without `--cacert` the same request is rejected as an untrusted root, as it should be.
 
 ## Feeds
 
