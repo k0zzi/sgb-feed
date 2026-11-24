@@ -1,0 +1,9 @@
+# Allowlist: entries here are never written to any feed, even if the SGB list contains them.
+# One entry per line. Anything after "#" is a comment.
+#   Domain: also covers its subdomains (example.com -> www.example.com, mail.example.com)
+#   IP:     exact match only
+# Changes are applied on the next sync (at the latest after SYNC_INTERVAL_MINUTES).
+#
+# Examples:
+# supplier-example.com.tr   # accounting software, added 2026-11
+# 203.0.113.10              # bank payment service

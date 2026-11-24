@@ -1,0 +1,67 @@
+name: sgb-feed
+
+services:
+  # Pulls the full list from the SGB API, updates it hourly and builds the feeds. The only service with internet access.
+  sync:
+    build: ./sync
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Europe/Istanbul}
+      PAGE_SIZE: ${PAGE_SIZE:-1500}
+      PART_SIZE: ${PART_SIZE:-128000}
+      FEED_WINDOWS: ${FEED_WINDOWS:-46,90,180,365}
+      FULL_RESYNC_DAYS: ${FULL_RESYNC_DAYS:-7}
+      SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-60}
+      HEALTH_MAX_AGE_MINUTES: ${HEALTH_MAX_AGE_MINUTES:-150}
+      COMPLETENESS_RATIO: ${COMPLETENESS_RATIO:-0.99}
+      # Set these in .env if a corporate proxy is required
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-}
+    volumes:
+      - data:/data
+      - ./config:/config:ro
+    networks: [egress]
+
+  # Read-only UI. Publishes no port; reachable only through nginx.
+  ui:
+    build: ./ui
+    restart: unless-stopped
+    depends_on: [sync]          # let sync create the data volume first (for file ownership)
+    environment:
+      TZ: ${TZ:-Europe/Istanbul}
+      STALE_AFTER_HOURS: ${STALE_AFTER_HOURS:-2.5}
+    volumes:
+      - data:/data:ro
+      - ./config:/config:ro
+      - ui-logs:/var/log/sgb
+    networks: [backend]
+
+  # Single entry point: HTTPS, IP restriction, password; UI + firewall feed files.
+  nginx:
+    build: ./nginx
+    restart: unless-stopped
+    depends_on: [ui]
+    ports:
+      - "${HTTPS_PORT:-1818}:443"
+    environment:
+      TZ: ${TZ:-Europe/Istanbul}
+      UI_USER: ${UI_USER:-admin}
+      UI_PASS: ${UI_PASS:?UI_PASS must be set in .env}
+      UI_ALLOWED: ${UI_ALLOWED:?UI_ALLOWED must be set in .env}
+      FEED_ALLOWED: ${FEED_ALLOWED:?FEED_ALLOWED must be set in .env}
+      CERT_CN: ${CERT_CN:-sgb-feed}
+      CERT_IP: ${CERT_IP:-}
+    volumes:
+      - data:/srv/feed:ro
+      - ./certs:/certs
+    networks: [backend, frontend]
+
+volumes:
+  data:
+  ui-logs:
+
+networks:
+  egress: {}               # sync -> internet
+  frontend: {}             # outside world -> nginx
+  backend:
+    internal: true         # nginx <-> ui; no internet access
