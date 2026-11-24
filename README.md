@@ -51,7 +51,7 @@ docker compose up -d --build
 The two address settings are easy to mix up:
 
 - `FEED_ALLOWED` is the address of the **firewall** (the client). It is the source address the server sees when the firewall pulls a feed.
-- `CERT_IP` is the address of **this server**, the one you put into the firewall's feed URL (for example `https://192.0.2.10:1818/feed/ip-part1.txt` means `CERT_IP=192.0.2.10`). The certificate is generated for this address on first start; if it is wrong or empty, the firewall rejects the certificate.
+- `CERT_IP` is the address of **this server**, the one you put into the firewall's feed URL (for example `https://192.168.2.10:1818/feed/ip-part1.txt` means `CERT_IP=192.168.2.10`). The certificate is generated for this address on first start; if it is wrong or empty, the firewall rejects the certificate.
 
 The first run fetches the whole list, which takes **10-30 minutes** depending on the API speed. To follow the progress:
 
