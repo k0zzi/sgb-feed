@@ -434,11 +434,11 @@ def test_records_added_during_full_scan_are_not_lost(env):
 # --- Real data: IDs do not decrease steadily with date ---
 
 def test_full_scan_with_non_monotonic_ids_reads_everything(env):
-    """2026-11 bug: some old records have a higher ID than some newer ones. The scan must not stop early."""
+    """Some older records have a higher ID than newer ones. The scan must not stop early."""
     data, use, feed, log_lines = env
     records = [rec(20, "n1.com", 1), rec(19, "n2.com", 2), rec(18, "n3.com", 3),
                rec(5, "m1.com", 100), rec(4, "m2.com", 101), rec(3, "m3.com", 102),
-               rec(30, "old1.com", 1500), rec(29, "old2.com", 1501), rec(28, "old3.com", 1502),  # bulk-loaded old records
+               rec(30, "old1.com", 1500), rec(29, "old2.com", 1501), rec(28, "old3.com", 1502),  # older records with higher IDs
                rec(2, "old4.com", 1600), rec(1, "old5.com", 1700)]
 
     class NoMeta(FakeAPI):  # worst case: no pageCount or page field, only a repeating last page

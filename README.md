@@ -178,16 +178,6 @@ git pull && docker compose up -d --build              # update
 | Log lines with `ATLANDI` (skipped), or the UI reports skipped pages after the last full scan | The API returned these pages empty 3 times in a row. The scan was accepted because it still passed the completeness check, but the records of those pages are missing until the next full scan (`FULL_RESYNC_DAYS`). The `WARNING` lines show what the API reported for each attempt. |
 | The firewall reports a certificate error when pulling a feed | Either the firewall does not trust `ca.crt` (see "Trusting the CA on the firewall"), or the address in the feed URL is not in the certificate (`CERT_IP`/`CERT_CN`). Check with `openssl x509 -in certs/server.crt -noout -ext subjectAltName`, then delete `certs/server.crt` and `certs/server.key` and restart nginx. |
 
-## Observed behavior of the SGB API
-
-The sync is written around these behaviors (observed as of 2026-11). If they change, the completeness check catches an incomplete scan.
-
-- `GET /api/address/index?page=N&per-page=K`: `page` is 1-based in the request; the `page` field in the response is 0-based. The response includes `totalCount` and `pageCount`. `per-page` is accepted up to at least 2000.
-- Records are sorted newest first **by date**. Record IDs do not decrease steadily with date (older records that were bulk-loaded in the past have higher IDs than some newer ones). For that reason no check relies on ID order.
-- When a page past the end is requested, the **last page is returned again** instead of an empty list. The end of the list is recognized from `pageCount`, the page number in the response, and repeated records.
-- A page inside the list (page number up to `pageCount`) can come back **empty** now and then. Asked again a few seconds later, the same page returns its records. In a full scan such a page is therefore requested 3 times in total (after waits of 2 and 4 seconds); if it is still empty it is skipped and the scan goes on, and after 3 skipped pages in a row the scan stops. The completeness check then decides as usual. Skipped pages are logged, listed as `skipped_pages` in `/api/status`, and shown in the UI until the next full scan without skipped pages. In an incremental scan an empty page still ends the scan.
-- The same address can appear several times with different IDs; it is written to the feeds once.
-
 ## Development
 
 The tests cover full and incremental scans against a fake API, chunk stability, the Lite windows, the allowlist, failure cases and the UI:

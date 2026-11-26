@@ -16,7 +16,7 @@ The full history is kept in a SQLite database (/data/sgb.db). On every run:
 
 If a scan does not complete (error, page limit, stop signal) the database and feeds are left untouched;
 the next scheduled run starts over.
-Assumption: the API returns records newest to oldest by date. IDs do not follow that order strictly (see scan_into).
+Records are taken as sorted newest to oldest by date; ID order is not relied on (see scan_into).
 """
 import datetime as dt
 import html
@@ -244,8 +244,8 @@ def fetch_page(session, page):
     except ValueError as e:
         raise RuntimeError(f"Sayfa {page}: API geçersiz (JSON olmayan) yanıt döndürdü; "
                            f"hiçbir dosya değiştirilmedi.") from e
-    # When a page past the end is requested the API repeats the LAST page instead of returning an
-    # empty list, so the 0-based "page", "pageCount" and "totalCount" of the response are returned too.
+    # The 0-based "page", "pageCount" and "totalCount" of the response are returned too;
+    # scan_into uses them to recognize the end of the list.
     return {"models": body.get("models") or [], "page_count": body.get("pageCount"),
             "total": body.get("totalCount"), "resp_page": body.get("page"), "elapsed": elapsed}
 
@@ -266,13 +266,11 @@ def get_meta(conn, key, default=None):
 def scan_into(conn, session, stop_id):
     """Reads newest to oldest and adds records to conn (does not commit). stop_id=0: full scan.
 
-    Observed behavior of the API (2026-11):
-      - Records come back newest first BY DATE. IDs do not decrease steadily with date:
-        older records that were bulk-loaded in the past have higher IDs than some newer ones.
-        For that reason no check relies on ID order.
-      - When a page past the end is requested, the last page is repeated instead of an empty list.
-      - A page inside the list (page <= pageCount) can come back empty now and then; asked again
-        a few seconds later it returns its records (measured 2026-11-26).
+    Cases handled:
+      - Records are taken as sorted newest first by date. ID order is not relied on: an older
+        record may have a higher ID than a newer one.
+      - A request past the end may return the last page again instead of an empty list.
+      - A page inside the list (page <= pageCount) may come back empty; see the retry rule below.
     The end of the list is recognized by any of these signals:
       1. the page number in the response differs from the one requested (pinned to the last page),
       2. pageCount was reached (using the current value from every response),
