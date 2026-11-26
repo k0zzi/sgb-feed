@@ -52,12 +52,18 @@ EMPTY_PAGE_ATTEMPTS = 3            # full scan: requests per page that comes bac
 EMPTY_PAGE_WAITS = (2, 4)          # seconds to wait before the 2nd and 3rd request
 MAX_CONSECUTIVE_SKIPS = 3          # full scan stops after this many skipped pages in a row
 ALLOWLIST_FILE = os.environ.get("ALLOWLIST_FILE", "/config/allowlist.txt")
+CONTROL_DIR = os.environ.get("SGB_CONTROL_DIR", "/control")   # shared with the UI: scan requests and state
+FULL_REQUEST_COOLDOWN_MINUTES = 60     # a requested full scan needs 60 min since the last full scan attempt
+UPDATE_REQUEST_COOLDOWN_MINUTES = 5    # a requested update needs 5 min since the last run
+REQUEST_POLL_SECONDS = 5               # how often the waiting loop looks for a request
 
 DB_FILE = os.path.join(BASE_DIR, "sgb.db")
 FEED_DIR = os.path.join(BASE_DIR, "feeds")
 STATUS_FILE = os.path.join(BASE_DIR, "status.json")
 LOG_FILE = os.path.join(BASE_DIR, "sgb_sync.log")
 RUN_MARKER = os.path.join(BASE_DIR, "sgb_sync.running")
+REQUEST_FILE = os.path.join(CONTROL_DIR, "request.json")
+STATE_FILE = os.path.join(CONTROL_DIR, "state.json")
 
 KINDS = ("domain", "ip", "ipv6", "url")
 LITE_KINDS = ("domain", "ip")
@@ -174,6 +180,108 @@ def atomic_write(path, data):
         f.write(data)
     os.chmod(tmp, 0o644)  # nginx and the UI read this as different users
     os.replace(tmp, path)
+
+
+# --- SCAN REQUESTS FROM THE UI (/control) ---
+# The UI cannot touch /data. It can only drop request.json into /control; this service decides whether
+# to run it and publishes its timings in state.json so the UI can show which button is available.
+
+_state = {"loop": False, "last_run_started": None, "last_full_started": None}
+
+
+def write_state():
+    """Best effort: a missing or read-only /control must never break a sync run."""
+    s = dict(_state, interval_minutes=SYNC_INTERVAL_MINUTES,
+             full_cooldown_minutes=FULL_REQUEST_COOLDOWN_MINUTES,
+             update_cooldown_minutes=UPDATE_REQUEST_COOLDOWN_MINUTES,
+             updated=dt.datetime.now().isoformat(timespec="seconds"))
+    for key, minutes in (("next_full_allowed", FULL_REQUEST_COOLDOWN_MINUTES),
+                         ("next_update_allowed", UPDATE_REQUEST_COOLDOWN_MINUTES)):
+        base = _state["last_full_started"] if key == "next_full_allowed" else _state["last_run_started"]
+        s[key] = ((dt.datetime.fromisoformat(base) + dt.timedelta(minutes=minutes)).isoformat(timespec="seconds")
+                  if base else None)
+    try:
+        os.makedirs(CONTROL_DIR, exist_ok=True)
+        atomic_write(STATE_FILE, json.dumps(s, ensure_ascii=False, indent=1))
+    except OSError as e:
+        log.warning(f"Kontrol durumu yazılamadı ({STATE_FILE}): {e}")
+
+
+def load_state():
+    """Restores the timings after a restart, so a restart does not reset the cooldowns."""
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            old = json.load(f)
+    except (OSError, ValueError):
+        return
+    for key in ("last_run_started", "last_full_started"):
+        try:
+            if old.get(key):
+                _state[key] = dt.datetime.fromisoformat(old[key]).isoformat(timespec="seconds")
+        except (TypeError, ValueError):
+            pass
+
+
+def note_run_start(mode, now):
+    _state["last_run_started"] = now.isoformat(timespec="seconds")
+    if mode == "full":
+        _state["last_full_started"] = _state["last_run_started"]
+    write_state()
+
+
+def take_request():
+    """Reads and removes request.json. Returns a valid request dict or None."""
+    try:
+        with open(REQUEST_FILE, encoding="utf-8") as f:
+            raw = f.read(4096)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        log.warning(f"Tarama isteği okunamadı: {e}")
+        return None
+    try:
+        os.remove(REQUEST_FILE)
+    except OSError:
+        pass
+    try:
+        req = json.loads(raw)
+    except ValueError:
+        req = None
+    if not isinstance(req, dict) or req.get("mode") not in ("full", "incremental"):
+        log.warning("Geçersiz tarama isteği yok sayıldı.")
+        return None
+    clean = lambda v: re.sub(r"[^\w.:@\-]", "", str(v or "-"))[:64] or "-"
+    return {"mode": req["mode"], "by": clean(req.get("by")), "ip": clean(req.get("ip"))}
+
+
+def db_has_full_scan():
+    if not os.path.exists(DB_FILE):
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True, timeout=30)
+        try:
+            return bool(get_meta(conn, "last_full_scan"))
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError:
+        return False
+
+
+def request_verdict(req, now):
+    """(mode to run, None) or (None, reason it was refused). Enforced here, not only in the UI."""
+    mode = req["mode"]
+    if mode == "incremental" and not db_has_full_scan():
+        mode = "full"   # nothing to update yet
+    if mode == "full":
+        base, minutes = _state["last_full_started"], FULL_REQUEST_COOLDOWN_MINUTES
+    else:
+        base, minutes = _state["last_run_started"], UPDATE_REQUEST_COOLDOWN_MINUTES
+    if base:
+        allowed = dt.datetime.fromisoformat(base) + dt.timedelta(minutes=minutes)
+        if now < allowed:
+            what = "tam tarama" if mode == "full" else "güncelleme"
+            return None, f"{what} saat {allowed.strftime('%H:%M')} sonrasında istenebilir"
+    return mode, None
 
 
 # --- API ---
@@ -608,7 +716,8 @@ URL feed'i yol içeren kayıtları içerir; Web Filter URL listesi olarak kullan
 
 # --- MAIN FLOW ---
 
-def run():
+def run(forced=None):
+    """forced: None (automatic) or a request dict from take_request() whose mode was already checked."""
     os.makedirs(FEED_DIR, exist_ok=True)
     now = dt.datetime.now()
     started = time.monotonic()
@@ -617,6 +726,13 @@ def run():
 
     recover_db()
     mode, reason = choose_mode(now)
+    if forced:
+        who = f"kullanıcı isteği: arayüz, {forced['by']}, {forced['ip']}"
+        if forced["mode"] == "full":
+            mode, reason = "full", who
+        elif mode == "incremental":
+            log.info(f"Güncelleme ({who}).")
+    note_run_start(mode, now)
     stats = full_scan(session, now, reason) if mode == "full" else incremental(session)
 
     conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True, timeout=30)
@@ -659,7 +775,7 @@ def _stop_signal(signum, frame):
     raise KeyboardInterrupt
 
 
-def main():
+def main(forced=None):
     os.makedirs(BASE_DIR, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
                         handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
@@ -679,7 +795,7 @@ def main():
 
     code = 1
     try:
-        run()
+        run(forced)
         log.info("--- Bitti: Başarılı. ---")
         code = 0
     except KeyboardInterrupt:
@@ -696,21 +812,47 @@ def main():
 
 
 def loop():
-    """Container mode: run now, then repeat every SYNC_INTERVAL_MINUTES minutes."""
+    """Container mode: run now, then repeat every SYNC_INTERVAL_MINUTES minutes or on a request from the UI."""
     for name in ("SIGINT", "SIGBREAK", "SIGTERM"):
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), _stop_signal)
+    _state["loop"] = True
+    load_state()
+    forced = None
     while True:
-        main()
+        main(forced)
         if _stop_requested:
             log.info("Senkronizasyon servisi kapanıyor.")
             return 0
         try:
             log.info(f"Sonraki çalıştırma {SYNC_INTERVAL_MINUTES} dakika sonra.")
-            time.sleep(SYNC_INTERVAL_MINUTES * 60)
+            write_state()
+            forced = wait_for_next_run(SYNC_INTERVAL_MINUTES * 60)
         except KeyboardInterrupt:
             log.info("Durdurma sinyali alındı, senkronizasyon servisi kapanıyor.")
             return 0
+
+
+def wait_for_next_run(seconds):
+    """Sleeps until the next scheduled run, waking early for a valid request from the UI.
+    Returns the request to run, or None for the scheduled run."""
+    deadline = time.monotonic() + seconds
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return None
+        time.sleep(min(REQUEST_POLL_SECONDS, left))
+        req = take_request()
+        if not req:
+            continue
+        what = "tam tarama" if req["mode"] == "full" else "güncelleme"
+        mode, refused = request_verdict(req, dt.datetime.now())
+        if refused:
+            log.warning(f"Arayüzden gelen {what} isteği reddedildi ({req['by']}, {req['ip']}): {refused}.")
+            continue
+        req["mode"] = mode
+        log.info(f"Arayüzden {what} isteği alındı ({req['by']}, {req['ip']}); başlatılıyor.")
+        return req
 
 
 if __name__ == "__main__":

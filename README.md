@@ -1,6 +1,6 @@
 # sgb-feed
 
-A Docker-based tool that keeps the **entire** malicious-address list published by SGB on your own server, refreshes it hourly, and turns it into **partitioned feeds** that firewalls can pull directly. It includes a **read-only lookup UI** for analysts.
+A Docker-based tool that keeps the **entire** malicious-address list published by SGB on your own server, refreshes it hourly, and turns it into **partitioned feeds** that firewalls can pull directly. It includes a **lookup UI** for analysts that reads the data read-only and can request a scan.
 
 > The web UI and the log messages are in Turkish. Everything else (documentation, configuration, code comments) is in English.
 
@@ -33,7 +33,7 @@ A Docker-based tool that keeps the **entire** malicious-address list published b
 | Service | Role | Exposed |
 |---|---|---|
 | `sync` | Pulls the list from the SGB API, updates the database and the feeds | No (outbound internet only) |
-| `ui` | Status screen and lookup | No (reachable only through nginx) |
+| `ui` | Status screen, lookup, scan buttons | No (reachable only through nginx) |
 | `nginx` | HTTPS, IP restriction, password; serves the UI and the feed files | Yes, a single port |
 
 ## Installation
@@ -155,9 +155,25 @@ git pull && docker compose up -d --build              # update
 - The UI audit log (who looked up what, and when) is kept in the `ui-logs` volume.
 - The database and the feeds live in the `data` volume (about 143 MB at the time of writing). If it is deleted, the next run fetches the whole list again.
 
+### Scan buttons
+
+The UI header has two buttons next to the status badge:
+
+- **Şimdi güncelle** (update now): fetches only the new records, like the hourly run. Available 5 minutes after the start of the previous run.
+- **Tam taramayı başlat** (start full scan): fetches the whole list again (about 20 minutes). Available 60 minutes after the start of the previous full scan, whether that scan succeeded or not. A full scan replaces the database only if it passes the completeness check, so a failed scan keeps the existing data.
+
+`sync` picks up a request within 5 seconds. The buttons are disabled while a scan is running, while a request is waiting, during the waiting times above, and when `sync` does not run in its loop mode; the reason is shown next to them. The waiting times are fixed in the code. Requests are recorded in the UI audit log and in the `sync` log with the user name and address.
+
+To delete all data (database, feeds, logs) and start from scratch, use the command line; the UI has no delete button:
+
+```bash
+docker compose down -v            # removes the containers and the data, control and ui-logs volumes
+docker compose up -d              # the first full scan starts again
+```
+
 ## Security notes
 
-- The UI is read-only; nginx allows GET requests only.
+- The UI cannot change the data. Its pages accept GET requests only; the only POST endpoint is `/action` (the scan buttons), protected by the same networks and password as the UI. It also requires a per-process form token and a same-origin request (Fetch Metadata `Sec-Fetch-Site`, or the `Origin` header as a fallback), so another site cannot trigger a scan through an analyst's browser. A request only writes a small file to the `control` volume; `sync` checks the waiting times again before it runs anything.
 - The `ui` service sits on an internal network without internet access and publishes no port. It mounts the data read-only.
 - Under `/feed/` only feed files whose name matches a fixed pattern are served. The database, the status file and the logs are never exposed.
 - The password is kept as a hash in nginx and is not forwarded to the UI.
@@ -176,6 +192,8 @@ git pull && docker compose up -d --build              # update
 | The UI says "Veritabanı şu an okunamıyor" (database cannot be read right now) | `sync` was killed during a write. It fixes itself when `sync` restarts. |
 | Log line `Tam tarama eksik: API ... kayıt bildiriyor, yalnızca ... kayıt görüldü` (full scan incomplete) | The scan finished without reaching the end of the list: too many pages were skipped (see the next row), or the API's paging behavior may have changed. Existing data is kept and the next run tries again. If it keeps repeating, check the API behavior. |
 | Log lines with `ATLANDI` (skipped), or the UI reports skipped pages after the last full scan | The API returned these pages empty 3 times in a row. The scan was accepted because it still passed the completeness check, but the records of those pages are missing until the next full scan (`FULL_RESYNC_DAYS`). The `WARNING` lines show what the API reported for each attempt. |
+| A scan button is disabled | Hold the mouse over the button or read the note next to it: a scan is running, a request is waiting, the waiting time has not passed, or `sync` is not running in its loop mode (`SYNC_INTERVAL_MINUTES=0` runs a single sync and exits). |
+| `İstek reddedildi.` (request refused) after pressing a button | The form token or the origin check failed. The token changes when the `ui` container restarts: reload the page and press the button again. |
 | The firewall reports a certificate error when pulling a feed | Either the firewall does not trust `ca.crt` (see "Trusting the CA on the firewall"), or the address in the feed URL is not in the certificate (`CERT_IP`/`CERT_CN`). Check with `openssl x509 -in certs/server.crt -noout -ext subjectAltName`, then delete `certs/server.crt` and `certs/server.key` and restart nginx. |
 
 ## Development

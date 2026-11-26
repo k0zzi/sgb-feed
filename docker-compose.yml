@@ -19,10 +19,12 @@ services:
       NO_PROXY: ${NO_PROXY:-}
     volumes:
       - data:/data
+      - control:/control
       - ./config:/config:ro
     networks: [egress]
 
-  # Read-only UI. Publishes no port; reachable only through nginx.
+  # Lookup UI. Reads the data read-only; it can only ask sync for a scan (via /control).
+  # Publishes no port; reachable only through nginx.
   ui:
     build: ./ui
     restart: unless-stopped
@@ -32,6 +34,7 @@ services:
       STALE_AFTER_HOURS: ${STALE_AFTER_HOURS:-2.5}
     volumes:
       - data:/data:ro
+      - control:/control
       - ./config:/config:ro
       - ui-logs:/var/log/sgb
     networks: [backend]
@@ -58,6 +61,7 @@ services:
 
 volumes:
   data:
+  control:                 # scan requests from the UI and the sync state (small JSON files)
   ui-logs:
 
 networks:

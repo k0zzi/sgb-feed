@@ -7,25 +7,31 @@ client IP and user name forwarded by nginx.
 
 It READS the files produced by sgb_sync.py and never modifies them:
   sgb.db (full history), status.json, feeds/*.txt + index.json, sgb_sync.log, sgb_sync.running
+The only thing it writes outside its own log is a scan request (request.json) in the shared /control
+directory; sgb_sync.py decides whether to run it (cooldowns are enforced there).
 
 Pages:
   /             Status screen + address lookup + last lines of the log
   /?q=address   Lookup: IP, domain, URL or keyword (whole history)
   /api/status   JSON status (for a PRTG/Zabbix HTTP sensor)
   /healthz      Container liveness check
+  POST /action  "Update now" / "Start full scan" buttons (CSRF token + Fetch Metadata / Origin check)
 """
 import base64
 import datetime as dt
 import hmac
 import html
+import http.cookies
 import ipaddress
 import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import ssl
 import sys
+import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlsplit
 
@@ -49,6 +55,21 @@ FEED_DIR = os.path.join(BASE_DIR, "feeds")
 SYNC_LOG = os.path.join(BASE_DIR, "sgb_sync.log")
 RUN_MARKER = os.path.join(BASE_DIR, "sgb_sync.running")
 UI_LOG = os.environ.get("UI_LOG_FILE", os.path.join(BASE_DIR, "sgb_ui.log"))  # /data is read-only in Docker
+CONTROL_DIR = os.environ.get("SGB_CONTROL_DIR", "/control")   # shared with sync: scan requests and state
+REQUEST_FILE = os.path.join(CONTROL_DIR, "request.json")
+STATE_FILE = os.path.join(CONTROL_DIR, "state.json")
+CSRF_TOKEN = secrets.token_urlsafe(32)   # per process; embedded only in password-protected pages
+MAX_FORM_BYTES = 1024
+ACTIONS = {"update": ("incremental", "güncelleme"), "full": ("full", "tam tarama")}
+FLASH_COOKIE = "sgb_flash"   # carries the result code of a button press to the next page view, once
+MESSAGES = {  # fixed texts selected by code: nothing from the request is echoed into the page
+    "queued_update": ("ok", "Güncelleme istendi; birkaç saniye içinde başlayacak."),
+    "queued_full": ("ok", "Tam tarama istendi; birkaç saniye içinde başlayacak. Yaklaşık 20 dakika sürer."),
+    "busy": ("warn", "İstek alınmadı: bir tarama sürüyor ya da sırada bekleyen bir istek var."),
+    "cooldown": ("warn", "İstek alınmadı: bekleme süresi dolmadı."),
+    "unavailable": ("warn", "İstek alınmadı: senkronizasyon şu an istek kabul etmiyor."),
+    "failed": ("bad", "İstek kaydedilemedi; ayrıntı sgb_ui.log dosyasında."),
+}
 
 LABEL_RE = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
 KIND_TITLES = {"domain": "Domain", "ip": "IPv4", "ipv6": "IPv6", "url": "URL"}
@@ -119,6 +140,64 @@ def get_status():
         st["ok"] = True
         st["message"] = "Sistem güncel."
     return st
+
+
+# --- SCAN BUTTONS ---
+
+def fmt_time(iso):
+    try:
+        t = dt.datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return "?"
+    return t.strftime("%H:%M") if t.date() == dt.date.today() else t.strftime("%d.%m %H:%M")
+
+
+def scan_actions(st=None, now=None):
+    """Which buttons can be used now, and why not. sync enforces the same rules again."""
+    now = now or dt.datetime.now()
+    st = st or get_status()
+    state = read_json(STATE_FILE)
+    res = {"update": None, "full": None, "note": None}     # None = available, else the reason
+    if not isinstance(state, dict) or not state.get("loop"):
+        reason = "Senkronizasyon döngü modunda değil." if isinstance(state, dict) else "Senkronizasyon durumu okunamadı."
+        return {"update": reason, "full": reason, "note": reason}
+    if st["running_since"]:
+        return {"update": "Tarama sürüyor.", "full": "Tarama sürüyor.",
+                "note": f"Tarama sürüyor (başlangıç {st['running_since']})."}
+    if os.path.exists(REQUEST_FILE):
+        r = "İstek sırada; birkaç saniye içinde başlayacak."
+        return {"update": r, "full": r, "note": r}
+    for key, field, what in (("full", "next_full_allowed", "Tam tarama"), ("update", "next_update_allowed", "Güncelleme")):
+        try:
+            allowed = dt.datetime.fromisoformat(state.get(field)) if state.get(field) else None
+        except (TypeError, ValueError):
+            allowed = None
+        if allowed and now < allowed:
+            res[key] = f"{what} saat {fmt_time(state.get(field))} sonrasında istenebilir."
+    if not st["last_full_scan"]:
+        res["update"] = "Önce tam tarama gerekiyor."
+    res["note"] = " ".join(dict.fromkeys(r for r in (res["update"], res["full"]) if r)) or None
+    return res
+
+
+def render_actions(acts):
+    def button(key, label):
+        why = acts[key]
+        dis = f" disabled title='{e(why)}'" if why else ""
+        return f"<button class='hbtn' type='submit' name='action' value='{key}'{dis}>{label}</button>"
+    note = f"<span class='hnote'>{e(acts['note'])}</span>" if acts["note"] else ""
+    return (f"<form class='hform' method='post' action='/action'><input type='hidden' name='token' value='{e(CSRF_TOKEN)}'>"
+            + button("update", "Şimdi güncelle") + button("full", "Tam taramayı başlat") + "</form>" + note)
+
+
+def write_request(mode, by, ip):
+    os.makedirs(CONTROL_DIR, exist_ok=True)
+    body = json.dumps({"mode": mode, "by": by, "ip": ip, "at": dt.datetime.now().isoformat(timespec="seconds")})
+    fd, tmp = tempfile.mkstemp(dir=CONTROL_DIR, prefix=".tmp_")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(body)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, REQUEST_FILE)
 
 
 # --- LOOKUP ---
@@ -288,6 +367,10 @@ th{color:#5c6475;font-weight:600}td.n{text-align:right;font-variant-numeric:tabu
 pre{background:#0f131b;color:#d6dbe4;padding:12px;border-radius:6px;overflow-x:auto;font-size:12px;line-height:1.45}
 .muted{color:#5c6475;font-size:13px}h2{font-size:16px;margin:0 0 12px}h3{font-size:14px;margin:16px 0 8px}
 code{background:#eceef2;padding:1px 5px;border-radius:4px;font-size:13px}.wrap{word-break:break-all}
+header>div{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end}
+.hform{display:inline-flex;gap:6px}.hbtn{padding:4px 12px;font-size:13px;background:#fff;color:#1d2330}
+.hbtn:disabled{opacity:.45;cursor:not-allowed}.hnote{color:#cfd6e4;font-size:12px}
+.msg{margin-bottom:16px}
 """
 
 
@@ -362,7 +445,7 @@ def render_search(res):
     return "".join(parts)
 
 
-def render_page(query=None):
+def render_page(query=None, msg=None):
     st = get_status()
     badge = ("ok" if st["ok"] and st["last_result_level"] != "ERROR" and not st["skipped_pages"]
              else ("warn" if st["ok"] else "bad"))
@@ -382,7 +465,8 @@ def render_page(query=None):
     last = st["last_success"].replace("T", " ") if st["last_success"] else "-"
     body = [
         f"<header><h1>SGB Engelleme Listesi</h1><div><span class='badge {badge}'>{e(st['message'])}</span>"
-        "<a href='/feed/'>Feed listesi</a></div></header><main>",
+        + render_actions(scan_actions(st)) + "<a href='/feed/'>Feed listesi</a></div></header><main>",
+        (f"<div class='badge {MESSAGES[msg][0]} msg'>{e(MESSAGES[msg][1])}</div>" if msg in MESSAGES else ""),
         "<div class='card grid'>",
         f"<div class='stat'><div class='n'>{num(fc.get('domain'))}</div><div class='l'>Domain</div></div>",
         f"<div class='stat'><div class='n'>{num(fc.get('ip'))}</div><div class='l'>IPv4</div></div>",
@@ -429,9 +513,11 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log.info(f"{self.client()} {fmt % args}")
 
-    def _send(self, code, body, ctype):
+    def _send(self, code, body, ctype, extra=()):
         data = body.encode("utf-8")
         self.send_response(code)
+        for name, value in extra:
+            self.send_header(name, value)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
@@ -454,17 +540,101 @@ class Handler(BaseHTTPRequestHandler):
         # bytes comparison: works with non-ASCII passwords too; & makes sure both are always evaluated
         return hmac.compare_digest(user.encode(), UI_USER.encode()) & hmac.compare_digest(pw.encode(), UI_PASS.encode())
 
-    def do_GET(self):
+    def _gate(self):
+        """Access control when running without nginx. True if the request may go on."""
         if not BEHIND_PROXY and not client_allowed(self.client_address[0], self.nets):
             log.warning(f"{self.client()} izin verilmeyen ağdan erişim denemesi reddedildi")
             self._send(403, "Erişim reddedildi.", "text/plain; charset=utf-8")
-            return
+            return False
         if not BEHIND_PROXY and not self._authorized():
             log.warning(f"{self.client()} hatalı ya da eksik kimlik bilgisi")
             self.send_response(401)
             self.send_header("WWW-Authenticate", 'Basic realm="SGB", charset="UTF-8"')
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return False
+        return True
+
+    def _same_origin(self):
+        """Fetch Metadata first; the Origin header as fallback for browsers that do not send it."""
+        site = self.headers.get("Sec-Fetch-Site")
+        if site is not None:
+            return site in ("same-origin", "none")
+        origin = self.headers.get("Origin")
+        if not origin:
+            return False
+        host = self.headers.get("X-Forwarded-Host") if BEHIND_PROXY else self.headers.get("Host")
+        return bool(host) and urlsplit(origin).netloc.lower() == host.lower()
+
+    def _flash_cookie(self, code, max_age):
+        secure = "; Secure" if BEHIND_PROXY or (CERT_FILE and KEY_FILE) else ""   # nginx serves HTTPS only
+        return f"{FLASH_COOKIE}={code}; Max-Age={max_age}; Path=/; HttpOnly; SameSite=Strict{secure}"
+
+    def _take_flash(self):
+        """The message code from the flash cookie, if any, and the header that deletes the cookie."""
+        try:
+            jar = http.cookies.SimpleCookie(self.headers.get("Cookie") or "")
+        except http.cookies.CookieError:
+            return None, ()
+        if FLASH_COOKIE not in jar:
+            return None, ()
+        code = jar[FLASH_COOKIE].value
+        return (code if code in MESSAGES else None), (("Set-Cookie", self._flash_cookie("", 0)),)
+
+    def _redirect(self, msg):
+        """POST/Redirect/GET: the result travels in a one-time cookie, so reloading the page does not show it again."""
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.send_header("Set-Cookie", self._flash_cookie(msg, 60))
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def do_POST(self):
+        if not self._gate():
+            return
+        if urlsplit(self.path).path != "/action":
+            self._send(404, "Bulunamadı.", "text/plain; charset=utf-8")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_FORM_BYTES:
+            self._send(413, "İstek çok büyük.", "text/plain; charset=utf-8")
+            return
+        form = parse_qs(self.rfile.read(length).decode("utf-8", errors="replace"))
+        token = (form.get("token") or [""])[0]
+        if not self._same_origin() or not hmac.compare_digest(token.encode(), CSRF_TOKEN.encode()):
+            log.warning(f"{self.client()} tarama isteği reddedildi: kaynak ya da form anahtarı geçersiz "
+                        f"(Sec-Fetch-Site={self.headers.get('Sec-Fetch-Site')!r}, Origin={self.headers.get('Origin')!r})")
+            self._send(403, "İstek reddedildi.", "text/plain; charset=utf-8")
+            return
+        action = (form.get("action") or [""])[0]
+        if action not in ACTIONS:
+            self._send(400, "Geçersiz işlem.", "text/plain; charset=utf-8")
+            return
+        mode, what = ACTIONS[action]
+        try:
+            acts = scan_actions()
+            refused = acts[action]
+            if refused:
+                code = ("busy" if refused.startswith(("Tarama sürüyor", "İstek sırada")) else
+                        "cooldown" if "sonrasında istenebilir" in refused else "unavailable")
+                log.info(f"{self.client()} {what} isteği alınmadı: {refused}")
+                self._redirect(code)
+                return
+            ip = self.headers.get("X-Real-IP", "?") if BEHIND_PROXY else self.client_address[0]
+            by = (self.headers.get("X-Remote-User") or "-") if BEHIND_PROXY else UI_USER
+            write_request(mode, by, ip)
+            log.info(f"{self.client()} {what} istedi.")
+            self._redirect(f"queued_{action}")
+        except Exception:
+            log.exception("Tarama isteği kaydedilemedi")
+            self._redirect("failed")
+
+    def do_GET(self):
+        if not self._gate():
             return
         url = urlsplit(self.path)
         try:
@@ -472,11 +642,19 @@ class Handler(BaseHTTPRequestHandler):
                 q = (parse_qs(url.query).get("q") or [""])[0][:300]
                 if q:
                     log.info(f"{self.client()} sorgu: {q!r}")
-                self._send(200, render_page(q), "text/html; charset=utf-8")
+                msg, clear = self._take_flash()
+                self._send(200, render_page(q, msg), "text/html; charset=utf-8", clear)
+            elif url.path == "/action":
+                self.send_response(405)
+                self.send_header("Allow", "POST")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
             elif url.path == "/healthz":  # container liveness check
                 self._send(200, "ok", "text/plain; charset=utf-8")
             elif url.path == "/api/status":
-                self._send(200, json.dumps(get_status(), ensure_ascii=False), "application/json; charset=utf-8")
+                st = get_status()
+                st["actions"] = scan_actions(st)
+                self._send(200, json.dumps(st, ensure_ascii=False), "application/json; charset=utf-8")
             else:
                 self._send(404, "Bulunamadı.", "text/plain; charset=utf-8")
         except Exception:

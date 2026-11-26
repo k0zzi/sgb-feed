@@ -89,6 +89,10 @@ def env(tmp_path, monkeypatch):
                       ("LOG_FILE", "sgb_sync.log"), ("RUN_MARKER", "sgb_sync.running")):
         monkeypatch.setattr(us, name, str(data / rel) if rel else str(data))
     monkeypatch.setattr(us, "ALLOWLIST_FILE", str(tmp_path / "allowlist.txt"))
+    control = tmp_path / "control"
+    for name, rel in (("CONTROL_DIR", ""), ("REQUEST_FILE", "request.json"), ("STATE_FILE", "state.json")):
+        monkeypatch.setattr(us, name, str(control / rel) if rel else str(control))
+    monkeypatch.setattr(us, "_state", {"loop": False, "last_run_started": None, "last_full_started": None})
     monkeypatch.setattr(us, "PAGE_SIZE", 3)
     monkeypatch.setattr(us, "PART_SIZE", 3)
     monkeypatch.setattr(us, "FEED_WINDOWS", [46, 365])
@@ -676,3 +680,130 @@ def test_empty_page_without_metadata_uses_last_known_page_count(env):
     assert api.calls == [1, 2, 2, 3, 4]
     assert feed("domain-part1.txt") == ["e.com", "a.com", "b.com"]
     assert any("Sayfa 2/4 boş döndü (deneme 1/3; API yanıtı: page=None, pageCount=None" in l for l in log_lines())
+
+
+# --- Scan requests from the UI (/control) ---
+
+def put_request(body):
+    os.makedirs(us.CONTROL_DIR, exist_ok=True)
+    with open(us.REQUEST_FILE, "w", encoding="utf-8") as f:
+        f.write(body if isinstance(body, str) else json.dumps(body))
+
+
+def fake_clock(monkeypatch):
+    t = [1000.0]
+    monkeypatch.setattr(us.time, "monotonic", lambda: t[0])
+    monkeypatch.setattr(us.time, "sleep", lambda s: t.__setitem__(0, t[0] + s))
+    return t
+
+
+def ago(minutes):
+    return (dt.datetime.now() - dt.timedelta(minutes=minutes)).isoformat(timespec="seconds")
+
+
+def test_full_request_runs_a_full_scan(env, monkeypatch):
+    data, use, feed, log_lines = env
+    use(FakeAPI(base_records()))
+    assert us.main() == 0                                              # first run: full
+    us._state["last_full_started"] = ago(61)
+    us._state["last_run_started"] = ago(61)
+    put_request({"mode": "full", "by": "admin", "ip": "192.168.10.1"})
+    fake_clock(monkeypatch)
+    req = us.wait_for_next_run(3600)
+    assert req == {"mode": "full", "by": "admin", "ip": "192.168.10.1"}
+    assert not os.path.exists(us.REQUEST_FILE)                         # consumed
+    assert us.main(req) == 0
+    assert json.loads((data / "status.json").read_text())["mode"] == "tam"
+    lines = log_lines()
+    assert any("Arayüzden tam tarama isteği alındı (admin, 192.168.10.1)" in l for l in lines)
+    assert any("Tam tarama başlıyor (kullanıcı isteği: arayüz, admin, 192.168.10.1)" in l for l in lines)
+
+
+def test_full_request_refused_within_cooldown(env, monkeypatch):
+    data, use, feed, log_lines = env
+    use(FakeAPI(base_records()))
+    assert us.main() == 0                                              # a full scan just started
+    put_request({"mode": "full", "by": "admin", "ip": "10.0.0.5"})
+    t = fake_clock(monkeypatch)
+    start = t[0]
+    assert us.wait_for_next_run(20) is None                            # refused, then the scheduled run
+    assert t[0] - start >= 20
+    assert not os.path.exists(us.REQUEST_FILE)
+    assert any("tam tarama isteği reddedildi (admin, 10.0.0.5): tam tarama" in l and "sonrasında istenebilir" in l
+               for l in log_lines())
+
+
+def test_failed_full_scan_counts_for_the_cooldown(env, monkeypatch):
+    data, use, feed, log_lines = env
+    use(FlakyAPI(base_records(), {2: 99}))                             # 70% < 99%: full scan fails
+    assert us.main() == 1
+    assert us._state["last_full_started"] is not None
+    mode, refused = us.request_verdict({"mode": "full", "by": "a", "ip": "b"}, dt.datetime.now())
+    assert mode is None and "sonrasında istenebilir" in refused             # 337 more requests only after 60 min
+    mode, refused = us.request_verdict({"mode": "full", "by": "a", "ip": "b"},
+                                       dt.datetime.now() + dt.timedelta(minutes=61))
+    assert mode == "full" and refused is None
+
+
+def test_update_request_and_its_cooldown(env, monkeypatch):
+    data, use, feed, log_lines = env
+    use(FakeAPI(base_records()))
+    assert us.main() == 0
+    req = {"mode": "incremental", "by": "admin", "ip": "x"}
+    assert us.request_verdict(req, dt.datetime.now())[0] is None       # within 5 min of the last run
+    later = dt.datetime.now() + dt.timedelta(minutes=6)
+    assert us.request_verdict(req, later) == ("incremental", None)
+    assert us.main({"mode": "incremental", "by": "admin", "ip": "x"}) == 0
+    assert json.loads((data / "status.json").read_text())["mode"] == "artımlı"
+    assert any("Güncelleme (kullanıcı isteği: arayüz, admin, x)." in l for l in log_lines())
+
+
+def test_update_request_without_database_becomes_full(env):
+    data, use, feed, log_lines = env
+    assert us.request_verdict({"mode": "incremental", "by": "a", "ip": "b"}, dt.datetime.now()) == ("full", None)
+
+
+def test_invalid_requests_are_ignored_and_removed(env, monkeypatch):
+    data, use, feed, log_lines = env
+    use(FakeAPI(base_records()))
+    assert us.main() == 0
+    fake_clock(monkeypatch)
+    for body in ("not json", {"mode": "delete"}, ["full"], {"by": "admin"}):
+        put_request(body)
+        assert us.wait_for_next_run(5) is None
+        assert not os.path.exists(us.REQUEST_FILE)
+    assert sum("Geçersiz tarama isteği yok sayıldı." in l for l in log_lines()) == 4
+
+
+def test_request_fields_are_sanitized_for_the_log(env, monkeypatch):
+    data, use, feed, log_lines = env
+    put_request({"mode": "full", "by": "admin\n2026 [INFO] --- Bitti: Başarılı. ---", "ip": "1.2.3.4; rm -rf /"})
+    req = us.take_request()
+    assert "\n" not in req["by"] and " " not in req["by"] and len(req["by"]) <= 64
+    assert req["ip"] == "1.2.3.4rm-rf"
+
+
+def test_state_file_and_restart(env, monkeypatch):
+    data, use, feed, log_lines = env
+    use(FakeAPI(base_records()))
+    us._state["loop"] = True
+    assert us.main() == 0
+    state = json.loads(open(us.STATE_FILE, encoding="utf-8").read())
+    assert state["loop"] is True and state["full_cooldown_minutes"] == 60 and state["update_cooldown_minutes"] == 5
+    start = dt.datetime.fromisoformat(state["last_full_started"])
+    assert dt.datetime.fromisoformat(state["next_full_allowed"]) == start + dt.timedelta(minutes=60)
+    assert dt.datetime.fromisoformat(state["next_update_allowed"]) == start + dt.timedelta(minutes=5)
+    monkeypatch.setattr(us, "_state", {"loop": True, "last_run_started": None, "last_full_started": None})
+    us.load_state()                                                    # container restart keeps the cooldowns
+    assert us._state["last_full_started"] == state["last_full_started"]
+
+
+def test_unwritable_control_dir_does_not_break_sync(env, monkeypatch, tmp_path):
+    data, use, feed, log_lines = env
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    monkeypatch.setattr(us, "CONTROL_DIR", str(blocker))
+    monkeypatch.setattr(us, "STATE_FILE", str(blocker / "state.json"))
+    use(FakeAPI(base_records()))
+    assert us.main() == 0
+    assert any("Kontrol durumu yazılamadı" in l for l in log_lines())

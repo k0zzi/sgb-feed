@@ -4,13 +4,13 @@ FROM python:3.13-slim
 RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin sgb \
-    && mkdir -p /var/log/sgb && chown sgb:sgb /var/log/sgb
+    && mkdir -p /var/log/sgb /control && chown sgb:sgb /var/log/sgb /control
 
 WORKDIR /app
 COPY sgb_ui.py .
 
 USER sgb
-ENV SGB_BASE_DIR=/data UI_HOST=0.0.0.0 UI_PORT=8080 BEHIND_PROXY=1 \
+ENV SGB_BASE_DIR=/data SGB_CONTROL_DIR=/control UI_HOST=0.0.0.0 UI_PORT=8080 BEHIND_PROXY=1 \
     UI_LOG_FILE=/var/log/sgb/sgb_ui.log PYTHONUNBUFFERED=1
 EXPOSE 8080
 

@@ -4,14 +4,14 @@ FROM python:3.13-slim
 RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin sgb \
-    && mkdir /data && chown sgb:sgb /data
+    && mkdir /data /control && chown sgb:sgb /data /control
 
 WORKDIR /app
 # Standard library only: no pip install, no PyPI access needed at build time
 COPY sgb_sync.py .
 
 USER sgb
-ENV SGB_BASE_DIR=/data PYTHONUNBUFFERED=1
+ENV SGB_BASE_DIR=/data SGB_CONTROL_DIR=/control PYTHONUNBUFFERED=1
 VOLUME ["/data"]
 
 # "unhealthy" if the last successful sync (status.json) is older than HEALTH_MAX_AGE_MINUTES.
