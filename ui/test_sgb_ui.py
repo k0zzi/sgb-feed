@@ -104,6 +104,7 @@ def test_blocked_domain_with_feeds_and_history(server):
     body = q(get, "evil.com")
     assert "ENGELLİ" in body and "domain-part1.txt" in body and "domain-46d.txt" in body
     assert "kayıt sayısı: 2" in body                      # two separate source records (id 3 and 6)
+    assert "SGB ID" not in body                           # internal API IDs are not shown to analysts
     assert "Bu host altındaki URL" in body and "evil.com/login" in body
 
 

@@ -312,10 +312,10 @@ def render_summary(s):
     out = [f"<p>{verdict} <b class='wrap'>{e(s['value'])}</b> <span class='muted'>({KIND_TITLES[s['kind']]})</span></p>",
            f"<p class='muted'>{feeds}<br>SGB listesinde ilk görülme: {e(s['first_seen'])} · son görülme: {e(s['last_seen'])} · "
            f"kayıt sayısı: {len(s['entries'])}</p>",
-           "<table><tr><th>SGB ID</th><th>Tarih</th><th>Açıklama</th><th>Kaynak</th><th>Kritiklik</th>"
+           "<table><tr><th>Tarih</th><th>Açıklama</th><th>Kaynak</th><th>Kritiklik</th>"
            "<th>Bağlantı türü</th><th>SGB'deki ham değer</th></tr>"]
     for r in s["entries"][:20]:
-        out.append(f"<tr><td>{e(r['id'])}</td><td>{e(r['date'])}</td><td>{e(r['descr'])}</td><td>{e(r['source'])}</td>"
+        out.append(f"<tr><td>{e(r['date'])}</td><td>{e(r['descr'])}</td><td>{e(r['source'])}</td>"
                    f"<td>{e(r['criticality'])}</td><td>{e(r['conntype'])}</td><td class='wrap'>{e(r['raw'])}</td></tr>")
     out.append("</table>")
     if len(s["entries"]) > 20:
