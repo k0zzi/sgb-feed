@@ -92,6 +92,7 @@ def get_status():
           "mode": s.get("mode"), "last_full_scan": s.get("last_full_scan"), "sgb_records": s.get("sgb_records"),
           "feed_counts": s.get("feed_counts", {}), "allowlisted": s.get("allowlisted"),
           "allowlist_count": len(load_allowlist()), "running_since": None,
+          "skipped_pages": s.get("skipped_pages") or [],
           "last_result": None, "last_result_level": None}
     if st["last_success"]:
         st["age_hours"] = round((now - dt.datetime.fromisoformat(st["last_success"])).total_seconds() / 3600, 2)
@@ -111,6 +112,9 @@ def get_status():
     elif st["last_result_level"] == "ERROR":
         st["ok"] = True
         st["message"] = "Feed'ler güncel, ancak son çalıştırma hatayla bitti."
+    elif st["skipped_pages"]:
+        st["ok"] = True
+        st["message"] = f"Feed'ler güncel, ancak son tam taramada {len(st['skipped_pages'])} sayfa atlandı."
     else:
         st["ok"] = True
         st["message"] = "Sistem güncel."
@@ -360,7 +364,8 @@ def render_search(res):
 
 def render_page(query=None):
     st = get_status()
-    badge = "ok" if st["ok"] and st["last_result_level"] != "ERROR" else ("warn" if st["ok"] else "bad")
+    badge = ("ok" if st["ok"] and st["last_result_level"] != "ERROR" and not st["skipped_pages"]
+             else ("warn" if st["ok"] else "bad"))
     fc = st["feed_counts"] or {}
     info = []
     if st["running_since"]:
@@ -370,6 +375,10 @@ def render_page(query=None):
     if st["last_full_scan"]:
         info.append(f"Son tam tarama: {e(st['last_full_scan'].replace('T', ' '))} · SGB kayıt sayısı: {num(st['sgb_records'])} · "
                     f"allowlist nedeniyle çıkarılan: {num(st['allowlisted'])}")
+    if st["skipped_pages"]:
+        pages = ", ".join(e(str(p)) for p in st["skipped_pages"])
+        info.append(f"Son tam taramada {len(st['skipped_pages'])} sayfa atlandı: Sayfa {pages}. "
+                    "Bu sayfalardaki kayıtlar bir sonraki tam taramaya kadar eksik olabilir.")
     last = st["last_success"].replace("T", " ") if st["last_success"] else "-"
     body = [
         f"<header><h1>SGB Engelleme Listesi</h1><div><span class='badge {badge}'>{e(st['message'])}</span>"

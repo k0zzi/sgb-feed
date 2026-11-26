@@ -167,3 +167,15 @@ def test_bare_ipv6_query(server):
     for query in ("2a00:41f::36f", "[2a00:41f::36f]", "http://[2a00:41f::36f]/"):
         body = q(get, query)
         assert "ENGELLİ" in body and "ipv6-part1.txt" in body, query
+
+
+def test_skipped_pages_shown(server):
+    get, data, _ = server
+    status = json.loads((data / "status.json").read_text())
+    status["skipped_pages"] = [212]
+    (data / "status.json").write_text(json.dumps(status))
+    body = get("/")[1]
+    assert "son tam taramada 1 sayfa atlandı" in body
+    assert "Son tam taramada 1 sayfa atlandı: Sayfa 212." in body
+    assert "badge warn" in body
+    assert json.loads(get("/api/status")[1])["skipped_pages"] == [212]

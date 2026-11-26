@@ -48,6 +48,9 @@ FULL_RESYNC_DAYS = int(os.environ.get("FULL_RESYNC_DAYS", "7"))   # 0: disabled
 SYNC_INTERVAL_MINUTES = int(os.environ.get("SYNC_INTERVAL_MINUTES", "0"))  # 0: run once and exit
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "2000"))             # safety limit
 COMPLETENESS_RATIO = float(os.environ.get("COMPLETENESS_RATIO", "0.99"))  # share of reported records a full scan must see
+EMPTY_PAGE_ATTEMPTS = 3            # full scan: requests per page that comes back empty before pageCount
+EMPTY_PAGE_WAITS = (2, 4)          # seconds to wait before the 2nd and 3rd request
+MAX_CONSECUTIVE_SKIPS = 3          # full scan stops after this many skipped pages in a row
 ALLOWLIST_FILE = os.environ.get("ALLOWLIST_FILE", "/config/allowlist.txt")
 
 DB_FILE = os.path.join(BASE_DIR, "sgb.db")
@@ -268,6 +271,8 @@ def scan_into(conn, session, stop_id):
         older records that were bulk-loaded in the past have higher IDs than some newer ones.
         For that reason no check relies on ID order.
       - When a page past the end is requested, the last page is repeated instead of an empty list.
+      - A page inside the list (page <= pageCount) can come back empty now and then; asked again
+        a few seconds later it returns its records (measured 2026-11-26).
     The end of the list is recognized by any of these signals:
       1. the page number in the response differs from the one requested (pinned to the last page),
       2. pageCount was reached (using the current value from every response),
@@ -275,6 +280,10 @@ def scan_into(conn, session, stop_id):
     In an incremental scan (stop_id > 0) every page is processed whole; records with an ID above
     stop_id are added, and the scan stops after the first page that contains a known record. Late-added
     records that land on the same page are caught that way; older ones are picked up by the weekly full scan.
+    In a full scan, an empty page with page <= pageCount is requested EMPTY_PAGE_ATTEMPTS times in total;
+    if it stays empty it is skipped and the scan goes on. After MAX_CONSECUTIVE_SKIPS skipped pages in a
+    row the scan stops. Skipped pages are returned in "skipped_pages". In an incremental scan an empty
+    page still ends the scan.
     In a full scan, if the number of unique records seen is below COMPLETENESS_RATIO times the
     totalCount reported at the start, the scan counts as incomplete and RuntimeError is raised.
     Records added while the scan runs shift the pages; this only causes a few records to be read
@@ -282,6 +291,7 @@ def scan_into(conn, session, stop_id):
     """
     page, highest, added, invalid = 1, stop_id, 0, 0
     seen, start_total = set(), None
+    skipped, consecutive_skips, known_page_count = [], 0, None
     while True:
         if page > MAX_PAGES:
             raise RuntimeError(f"{MAX_PAGES} sayfa sınırına ulaşıldı; hiçbir dosya değiştirilmedi.")
@@ -289,6 +299,43 @@ def scan_into(conn, session, stop_id):
         models, page_count, elapsed = r["models"], r["page_count"], r["elapsed"]
         if start_total is None and isinstance(r["total"], int):
             start_total = r["total"]
+        if isinstance(page_count, int):
+            known_page_count = page_count
+        elif not models and known_page_count:
+            page_count = known_page_count    # a faulty empty response may come without metadata
+        if not models and stop_id == 0 and isinstance(page_count, int) and page <= page_count:
+            # An empty page inside the list is a transient API fault: ask again, then skip it.
+            for attempt in range(1, EMPTY_PAGE_ATTEMPTS + 1):
+                detail = (f"API yanıtı: page={r['resp_page']}, pageCount={r['page_count']}, "
+                          f"totalCount={r['total']}; {r['elapsed']:.1f} sn")
+                if attempt == EMPTY_PAGE_ATTEMPTS:
+                    log.warning(f"Sayfa {page}/{page_count} boş döndü (deneme {attempt}/{EMPTY_PAGE_ATTEMPTS}; {detail}).")
+                    break
+                wait = EMPTY_PAGE_WAITS[min(attempt - 1, len(EMPTY_PAGE_WAITS) - 1)]
+                log.warning(f"Sayfa {page}/{page_count} boş döndü (deneme {attempt}/{EMPTY_PAGE_ATTEMPTS}; {detail}). "
+                            f"{wait} sn sonra tekrar istenecek.")
+                time.sleep(wait)
+                r = fetch_page(session, page)
+                models, elapsed = r["models"], r["elapsed"]
+                if isinstance(r["page_count"], int):
+                    page_count = known_page_count = r["page_count"]
+                if models:
+                    log.info(f"Sayfa {page}: {attempt + 1}. denemede kayıtlarla döndü, devam ediliyor.")
+                    break
+            if not models:
+                skipped.append(page)
+                consecutive_skips += 1
+                log.warning(f"Sayfa {page} {EMPTY_PAGE_ATTEMPTS} denemede de boş döndü, ATLANDI. Bu sayfadaki kayıtlar "
+                            f"bir sonraki tam taramaya kadar eksik kalabilir.")
+                if consecutive_skips >= MAX_CONSECUTIVE_SKIPS:
+                    log.warning(f"Art arda {consecutive_skips} sayfa atlandı (sayfa {', '.join(map(str, skipped[-consecutive_skips:]))}); "
+                                f"tarama durduruluyor, bütünlük kontrolü karar verecek.")
+                    break
+                if page >= page_count:
+                    break
+                page += 1
+                time.sleep(0.2)
+                continue
         if not models:
             log.info(f"Sayfa {page} ({elapsed:.1f} sn): boş. Listenin sonuna ulaşıldı.")
             break
@@ -300,6 +347,7 @@ def scan_into(conn, session, stop_id):
             log.info(f"Sayfa {page}: kayıtların çoğu bu taramada zaten görülmüş (API son sayfayı tekrarlıyor). "
                      f"Listenin sonuna ulaşıldı.")
             break
+        consecutive_skips = 0
         rows, known = [], 0
         for m in models:
             item_id = m.get("id")
@@ -341,16 +389,19 @@ def scan_into(conn, session, stop_id):
         page += 1
         time.sleep(0.2)
 
+    if skipped:
+        log.warning(f"Atlanan sayfalar: {', '.join(map(str, skipped))}.")
     if stop_id == 0 and start_total:
         ratio = len(seen) / start_total
         log.info(f"Bütünlük kontrolü: API {start_total} kayıt bildirdi, taramada {len(seen)} benzersiz kayıt görüldü "
                  f"(%{ratio * 100:.1f}).")
         if ratio < COMPLETENESS_RATIO:
             raise RuntimeError(f"Tam tarama eksik: API {start_total} kayıt bildiriyor, yalnızca {len(seen)} kayıt "
-                               f"görüldü (%{ratio * 100:.1f}). Mevcut veri ve feed'ler korundu; "
-                               f"sonraki çalıştırma tekrar deneyecek.")
+                               f"görüldü (%{ratio * 100:.1f})"
+                               + (f", atlanan sayfa: {', '.join(map(str, skipped))}" if skipped else "")
+                               + ". Mevcut veri ve feed'ler korundu; sonraki çalıştırma tekrar deneyecek.")
     return {"pages": page, "added": added, "invalid": invalid, "highest": highest,
-            "seen": len(seen), "total": start_total}
+            "seen": len(seen), "total": start_total, "skipped_pages": skipped}
 
 
 def distinct_count(conn, schema="main"):
@@ -367,8 +418,8 @@ def full_scan(session, now, reason):
     conn = connect(tmp_db)
     try:
         stats = scan_into(conn, session, 0)
-        conn.execute("INSERT OR REPLACE INTO meta VALUES ('last_id', ?), ('last_full_scan', ?)",
-                     (str(stats["highest"]), now.isoformat(timespec="seconds")))
+        conn.execute("INSERT OR REPLACE INTO meta VALUES ('last_id', ?), ('last_full_scan', ?), ('skipped_pages', ?)",
+                     (str(stats["highest"]), now.isoformat(timespec="seconds"), json.dumps(stats["skipped_pages"])))
         conn.commit()
         if os.path.exists(DB_FILE):
             conn.execute("ATTACH DATABASE ? AS old", (DB_FILE,))
@@ -391,6 +442,8 @@ def full_scan(session, now, reason):
            f"{stats['invalid']} geçersiz.")
     if "removed" in stats:
         msg += f" SGB listesinden kaldırılan (artık listede olmayan) adres: {stats['removed']}."
+    if stats["skipped_pages"]:
+        msg += f" Atlanan sayfa ({len(stats['skipped_pages'])}): {', '.join(map(str, stats['skipped_pages']))}."
     log.info(msg)
     return stats
 
@@ -573,13 +626,18 @@ def run():
         total_rows = conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
         last_id = int(get_meta(conn, "last_id", "0"))
         last_full = get_meta(conn, "last_full_scan")
+        try:
+            skipped_pages = json.loads(get_meta(conn, "skipped_pages", "[]"))
+        except ValueError:
+            skipped_pages = []
     finally:
         conn.close()
 
     status = {"last_success": None, "mode": stats["mode"],
               "last_id": last_id, "last_full_scan": last_full, "sgb_records": total_rows,
               "added": stats["added"], "removed": stats.get("removed"), "pages": stats["pages"],
-              "page_size": PAGE_SIZE, "feed_windows": FEED_WINDOWS, "full_resync_days": FULL_RESYNC_DAYS}
+              "page_size": PAGE_SIZE, "feed_windows": FEED_WINDOWS, "full_resync_days": FULL_RESYNC_DAYS,
+              "skipped_pages": skipped_pages}
     feeds, fstats = build_feeds(now, allow)
     # last_success is the time the run finished building the feeds, not the time it started: a full
     # scan takes ~20 minutes, and the feed index and files must agree with this timestamp.

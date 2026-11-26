@@ -519,3 +519,160 @@ def test_last_success_is_completion_time(env, monkeypatch):
     index = json.loads((data / "feeds" / "index.json").read_text())
     assert status["last_success"] == "2099-01-01T12:00:00"
     assert index["last_success"] == status["last_success"]
+
+
+# --- Empty pages inside the list (transient API fault) ---
+
+class FlakyAPI(FakeAPI):
+    """Returns an empty page (with full metadata) for the first `empties[page]` requests of that page."""
+    def __init__(self, records, empties):
+        super().__init__(records)
+        self.empties = dict(empties)
+
+    def get(self, url, params, timeout):
+        r = super().get(url, params, timeout)
+        page = params["page"]
+        if self.empties.get(page, 0) > 0:
+            self.empties[page] -= 1
+            r.body["models"] = []
+        return r
+
+
+def many_records(n):
+    return [rec(i, f"x{i}.com", 1) for i in range(n, 0, -1)]          # newest to oldest
+
+
+def test_empty_page_is_asked_again_and_scan_continues(env, monkeypatch):
+    data, use, feed, log_lines = env
+    waits = []
+    monkeypatch.setattr(us.time, "sleep", waits.append)                 # record the waits instead of sleeping
+    api = use(FlakyAPI(base_records(), {2: 1}))                        # page 2 empty once
+    assert us.main() == 0
+    assert api.calls == [1, 2, 2, 3, 4]                                # asked again once, then went on
+    assert 2 in waits                                                  # waited 2 s before the 2nd request
+    assert feed("domain-part1.txt") == ["e.com", "a.com", "b.com"]     # nothing lost
+    lines = log_lines()
+    assert any("Sayfa 2/4 boş döndü (deneme 1/3" in l and "pageCount=4" in l for l in lines)
+    assert any("2. denemede kayıtlarla döndü" in l for l in lines)
+    assert json.loads((data / "status.json").read_text())["skipped_pages"] == []
+
+
+def test_page_empty_three_times_is_skipped(env, monkeypatch):
+    data, use, feed, log_lines = env
+    monkeypatch.setattr(us, "COMPLETENESS_RATIO", 0.5)                 # 3 of 10 records missing must still pass here
+    waits = []
+    monkeypatch.setattr(us.time, "sleep", waits.append)
+    api = use(FlakyAPI(base_records(), {2: 99}))                       # page 2 always empty
+    assert us.main() == 0
+    assert api.calls == [1, 2, 2, 2, 3, 4]                             # 3 requests for page 2, then on to page 3
+    assert [w for w in waits if w != 0.2] == [2, 4]
+    lines = log_lines()
+    assert sum("Sayfa 2/4 boş döndü" in l for l in lines) == 3
+    assert any("Sayfa 2 3 denemede de boş döndü, ATLANDI" in l for l in lines)
+    assert any("Atlanan sayfa (1): 2." in l for l in lines)
+    status = json.loads((data / "status.json").read_text())
+    assert status["skipped_pages"] == [2]
+    # page 2 = ids 7, 6, 5 (c.com/phish, c.com, b.com) was skipped; pages 1 and 3 are complete
+    assert feed("domain-part1.txt") == ["e.com", "a.com", "d.com"]
+    assert feed("domain-part2.txt") is None
+    assert feed("url-part1.txt") == []
+    assert "--- Bitti: Başarılı. ---" in lines[-1]
+
+
+def test_skipped_page_below_completeness_is_rejected(env):
+    data, use, feed, log_lines = env
+    use(FlakyAPI(base_records(), {2: 99}))                             # 3 of 10 missing = 70% < 99%
+    assert us.main() == 1
+    assert not (data / "sgb.db").exists()
+    assert "atlanan sayfa: 2" in log_lines()[-1]
+
+
+def test_three_consecutive_skips_stop_the_scan(env, monkeypatch):
+    data, use, feed, log_lines = env
+    monkeypatch.setattr(us, "COMPLETENESS_RATIO", 0.1)
+    api = use(FlakyAPI(many_records(18), {2: 99, 3: 99, 4: 99}))       # 6 pages; pages 2-4 always empty
+    assert us.main() == 0
+    assert api.calls == [1, 2, 2, 2, 3, 3, 3, 4, 4, 4]                 # stopped, pages 5-6 not requested
+    assert any("Art arda 3 sayfa atlandı (sayfa 2, 3, 4)" in l for l in log_lines())
+    assert json.loads((data / "status.json").read_text())["skipped_pages"] == [2, 3, 4]
+
+
+def test_skip_counter_resets_after_a_full_page(env, monkeypatch):
+    data, use, feed, log_lines = env
+    monkeypatch.setattr(us, "COMPLETENESS_RATIO", 0.1)
+    api = use(FlakyAPI(many_records(18), {2: 99, 3: 99, 5: 99}))       # 2, 3 skipped; 4 full; 5 skipped
+    assert us.main() == 0
+    assert api.calls == [1, 2, 2, 2, 3, 3, 3, 4, 5, 5, 5, 6]           # never 3 in a row -> read to the end
+    assert json.loads((data / "status.json").read_text())["skipped_pages"] == [2, 3, 5]
+
+
+def test_skipped_pages_stay_visible_until_next_full_scan(env, monkeypatch):
+    data, use, feed, log_lines = env
+    monkeypatch.setattr(us, "COMPLETENESS_RATIO", 0.5)
+    use(FlakyAPI(base_records(), {2: 99}))
+    assert us.main() == 0
+    use(FakeAPI(base_records()))                                       # next hour: incremental run
+    assert us.main() == 0
+    status = json.loads((data / "status.json").read_text())
+    assert status["mode"] == "artımlı" and status["skipped_pages"] == [2]
+    monkeypatch.setattr(us.dt, "datetime", type("D", (dt.datetime,), {
+        "now": classmethod(lambda c: NOW + dt.timedelta(days=8))}))
+    use(FakeAPI(base_records()))                                       # weekly full scan without faults
+    assert us.main() == 0
+    status = json.loads((data / "status.json").read_text())
+    assert status["mode"] == "tam" and status["skipped_pages"] == []
+    assert feed("domain-part2.txt") == ["c.com", "d.com"]              # the gap is closed (b.com, c.com back)
+    assert feed("url-part1.txt") == ["c.com/phish"]
+
+
+def test_empty_page_in_incremental_scan_still_ends_it(env):
+    data, use, feed, log_lines = env
+    use(FakeAPI(base_records()))
+    assert us.main() == 0
+    api = use(FlakyAPI(base_records(), {1: 99}))
+    assert us.main() == 0
+    assert api.calls == [1]                                            # no retries in incremental mode
+    assert json.loads((data / "status.json").read_text())["skipped_pages"] == []
+
+
+def test_empty_page_without_page_count_still_ends_scan(env):
+    data, use, feed, log_lines = env
+
+    class NoMetaEmpty(FlakyAPI):
+        def get(self, url, params, timeout):
+            r = super().get(url, params, timeout)
+            r.body.pop("pageCount", None)
+            return r
+    api = use(NoMetaEmpty(base_records(), {2: 99}))
+    assert us.main() == 1                                              # treated as end of list -> incomplete
+    assert api.calls == [1, 2]                                         # not retried without a known pageCount
+
+
+def test_database_from_older_version_without_skipped_pages(env):
+    """A database written before skipped_pages existed must keep working (upgrade path)."""
+    data, use, feed, log_lines = env
+    use(FakeAPI(base_records()))
+    assert us.main() == 0
+    conn = sqlite3.connect(data / "sgb.db")
+    conn.execute("DELETE FROM meta WHERE key = 'skipped_pages'")
+    conn.commit()
+    conn.close()
+    assert us.main() == 0                                              # incremental run on the old database
+    assert json.loads((data / "status.json").read_text())["skipped_pages"] == []
+
+
+def test_empty_page_without_metadata_uses_last_known_page_count(env):
+    """If the faulty empty response carries no pageCount, the value from earlier pages is used."""
+    data, use, feed, log_lines = env
+
+    class BareEmpty(FlakyAPI):
+        def get(self, url, params, timeout):
+            r = super().get(url, params, timeout)
+            if not r.body["models"]:
+                r.body = {"models": []}                                # no page, pageCount, totalCount
+            return r
+    api = use(BareEmpty(base_records(), {2: 1}))
+    assert us.main() == 0
+    assert api.calls == [1, 2, 2, 3, 4]
+    assert feed("domain-part1.txt") == ["e.com", "a.com", "b.com"]
+    assert any("Sayfa 2/4 boş döndü (deneme 1/3; API yanıtı: page=None, pageCount=None" in l for l in log_lines())
